@@ -1,0 +1,68 @@
+from turtledemo.penrose import start
+
+import pyautogui
+import keyboard
+import time
+
+def create_his_tag_macro(tag_prefix: str, start_num: int, end_num: int):
+    for _idx in range(start_num, end_num):
+        pyautogui.moveTo(1017, 536)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.moveTo(1100, 830)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.moveTo(1481, 766)
+        pyautogui.click()
+        time.sleep(0.2)
+        # NUMLOCK 꺼져있어야됌
+        pyautogui.press('home')
+        time.sleep(0.2)
+        pyautogui.keyDown('shift')
+        time.sleep(0.2)
+        pyautogui.moveTo(1481, 766)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.keyUp('shift')
+        time.sleep(0.5)
+
+        _tag_name = tag_prefix + str(_idx).rjust(4, '0')
+        pyautogui.write(_tag_name)
+        time.sleep(0.2)
+        pyautogui.press('enter')
+        time.sleep(1)
+
+def create_biz_tag_macro(tag_prefix: str, start_num: int, end_num: int):
+    for _idx in range(start_num, end_num):
+        pyautogui.moveTo(1879, 278)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.moveTo(1514, 508)
+        pyautogui.click()
+        time.sleep(0.2)
+        _tag_name = tag_prefix + str(_idx).rjust(4, '0')
+        pyautogui.write(_tag_name)
+        time.sleep(0.2)
+        pyautogui.moveTo(1099, 564)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.moveTo(1064, 715)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.moveTo(1018, 1194)
+        pyautogui.click()
+        time.sleep(0.2)
+        pyautogui.moveTo(1640, 1267)
+        pyautogui.click()
+        time.sleep(1)
+        pyautogui.moveTo(1272, 921)
+        pyautogui.click()
+        time.sleep(1)
+
+    #x, y = pyautogui.position()
+    #print(x)
+    #print(y)
+    #pyautogui.click()
+    #pyautogui.write('')
+    #pyautogui.moveTo(500, 500)
+    #pyautogui.click()

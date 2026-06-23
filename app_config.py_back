@@ -1,0 +1,225 @@
+import logging
+import logging.handlers
+import sys
+import threading
+import time
+import typing
+import json
+from configparser import ConfigParser
+from datetime import datetime, timedelta
+import schedule
+
+import logics
+import communication_
+
+
+class ConfigUtil:
+    """ 설정 클래스 """
+    _instance = None
+    __inited: bool = False
+    __configs: ConfigParser = None
+    __list_none_value: list = [None, '', 'None']
+    __config_options: dict = {
+        'CONFIG': {
+            'MODE': 'DEV',
+            'BIT': '64',
+            'DATEFORMAT': '%Y-%m-%d %p %I:%M:%S',
+            'PERIOD': 'm'
+        }, 'SOCKET': {
+            'IP': '127.0.0.1',
+            'PORT': 8180,
+            'BUFFER_SIZE': 10 * 1024 * 1024
+        }, 'DATABASE': {
+            'DSN': None,
+            'DRIVER': None,
+            'IP': None,
+            'PORT': None,
+            'DATABASE': None,
+            'USER': None,
+            'PASSWORD': None,
+            'MAX_CONNECTION': 1,
+            'MIN_CACHE': 1,
+            'MAX_CACHE': 1,
+            'MAX_SHARE': 1
+        }, 'HISTORIAN': {
+            'IP': None,
+            'USER': None,
+            'PASSWORD': None,
+            'LOCAL_TIME': False
+        }, 'BIZNEXUS': {
+            'IP': None,
+            'PORT': None
+        }
+    }
+
+    def __new__(cls, *args, **kwargs) -> _instance:
+        if cls._instance is None:
+            cls._instance = super(ConfigUtil, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self, config_file_name: str = None) -> None:
+        if config_file_name in self.__list_none_value:
+            config_file_name = 'config.ini'
+        if not self.__inited:
+            self.__inited = True
+            self.__parse_config(config_file_name=config_file_name)
+
+    def get_none_values(self) -> list:
+        return self.__list_none_value
+
+    def __parse_config(self, config_file_name: str) -> None:
+        """ config 파일에서 데이터를 불러와 dict에 저장
+            Args:
+                config_file_name (str): config 파일명
+        """
+        self.__configs = ConfigParser()
+        if not self.__configs.read(config_file_name):
+            LogUtil().error(
+                message=f'{self.__module__}.{self.__class__.__name__}.parse_config Error: Config File Not Exist'
+            )
+            sys.exit(1)
+
+        for key in self.__config_options.keys():
+            if not self.__configs.has_section(key):
+                continue
+            for value in self.__config_options[key].keys():
+                if not self.__configs.has_option(key, value):
+                    continue
+                self.__config_options[key][value] = self.__configs.get(key, value)
+
+    def get_configs(self) -> dict:
+        """ config dict를 불러옴
+            Returns:
+                self.__config_options (dict): config dict
+        """
+        return self.__config_options
+
+
+class LogUtil:
+    """ 로그관련 클래스 """
+    _instance = None
+    __inited: bool = False
+    __logger: logging.Logger = None
+    __config: dict = None
+
+    def __new__(cls, *args, **kwargs) -> _instance:
+        if cls._instance is None:
+            cls._instance = super(LogUtil, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        if not self.__inited:
+            self.__inited = True
+            self.__logger = logging.getLogger(name=__name__)
+            self.__config = ConfigUtil().get_configs().get('CONFIG')
+            if self.__config is not None and self.__config.get('MODE') == 'OPER':
+                _log_format: str = '[%(asctime)s-%(levelname)s] >> %(message)s'
+                _log_formatter: logging.Formatter = logging.Formatter(fmt=_log_format)
+                _file_max_bytes: int = 100 * 1024 * 1024
+                _file_name_prefix: str = datetime.now().strftime('%y%m%d')
+                #_file_name: str = f'{_file_name_prefix}_daesanAdaptor.log'
+                _file_name: str = f'daesanAdaptor.log'
+
+                _log_file_handler: logging.handlers.TimedRotatingFileHandler = logging.handlers.TimedRotatingFileHandler(
+                    filename=f'./{_file_name}',
+                    when='midnight',
+                    interval=1,
+                    backupCount=20,
+                    encoding='utf-8'
+                )
+                _log_file_handler.prefix = _file_name_prefix
+                _log_file_handler.setFormatter(fmt=_log_formatter)
+
+                self.__logger.propagate = False
+                self.__logger.setLevel(level=logging.INFO)
+                self.__logger.addHandler(hdlr=_log_file_handler)
+
+    def get_logger(self) -> logging.Logger:
+        """ 로거 가져오기
+            Returns:
+                self.__logger (logging.Logger): 로거
+        """
+        return self.__logger
+
+    def info(self, message: str) -> None:
+        """ 인포로그 기록
+            Args:
+                message (str): 표시할 메세지
+        """
+        if self.__config is not None and self.__config.get('MODE') == 'OPER':
+            self.__logger.log(level=logging.INFO, msg=message)
+        else:
+            print(f'[{datetime.now()}-INFO] >> {message}')
+
+    def error(self, message: str) -> None:
+        """ 에러로그 기록
+            Args:
+                message (str): 표시할 메세지
+        """
+        if self.__config is not None and self.__config.get('MODE') == 'OPER':
+            self.__logger.log(level=logging.ERROR, msg=message)
+        else:
+            print(f'[{datetime.now()}-ERROR] >> {message}')
+
+
+class Scheduler:
+    """ 스케쥴러관련 클래스 """
+    _instance = None
+    __inited: bool = False
+    __scheduler_thread: threading.Thread = None
+    __str_time: str = ''
+    __scheduler_func: typing.Callable = None
+
+    def __new__(cls, *args, **kwargs) -> _instance:
+        if cls._instance is None:
+            cls._instance = super(Scheduler, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self, str_time: str = '00:00', schedule_func: typing.Callable = None) -> None:
+        if not self.__inited:
+            self.__inited = True
+            self.__str_time = str_time
+            if schedule_func is None:
+                self.__scheduler_func = self.__default_scheduler_func
+            else:
+                self.__scheduler_func = schedule_func
+
+    def run_scheduler(self) -> None:
+        """ 스케쥴러 쓰레드 실행 """
+        self.__scheduler_thread = threading.Thread(target=self.__run_scheduler)
+        self.__scheduler_thread.start()
+
+    def __run_scheduler(self) -> None:
+        """ 스케쥴러 함수 실행 """
+        if self.__scheduler_func is not None:
+            schedule.every().day.at(self.__str_time).do(self.__scheduler_func)
+            while True:
+                schedule.run_pending()
+                time.sleep(10)
+
+    def _default_scheduler_func(self) -> None:
+        self.__default_scheduler_func()
+
+    def __default_scheduler_func(self) -> None:
+        _str_start_day: str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        _str_end_day: str = (datetime.now() - timedelta(days=1)).strftime('%Y-%m-%d')
+        _database: communication_.Database = communication_.Database()
+        _list_revisn_tag: list = _database.select_revisn_data()
+        _list_tag_list: list = []
+        for _dict_revisn_tag in _list_revisn_tag:
+            _tag_nm: str = _dict_revisn_tag.get('TAG_NM')
+            _list_tag_list.append(_tag_nm)
+        _start: str = f'{_str_start_day} 00:00:00'
+        _end: str = f'{_str_end_day} 23:59:59'
+        _str_cmd: str = f"""{{
+            "cmd": "revisnData",
+            "param": {{
+                "tagList": {_list_tag_list},
+                "start": "{_start}",
+                "end": "{_end}",
+                "auto": "true"
+            }}
+        }}"""
+        _str_cmd: str = _str_cmd.replace("'", '"')
+        _dict_cmd: dict = json.loads(_str_cmd)
+        logics.Logics().revisn_data(dict_cmd=_dict_cmd, list_revisn_tag=_list_revisn_tag)

@@ -1,0 +1,806 @@
+import asyncio
+import ctypes
+import json
+import os
+import re
+import socket
+import sys
+import threading
+import traceback
+from datetime import datetime, timedelta
+from io import StringIO
+
+import clr
+import dbutils.pooled_db
+import pyodbc
+from dbutils.pooled_db import PooledDB
+
+import app_config_
+import logics
+
+
+class Database:
+    """ 데이터베이스 클래스 """
+    _instance = None
+    __inited: bool = False
+    __pool: dbutils.pooled_db.PooledDB = None
+    __max_insert_row_count: int = 49
+
+    def __new__(cls, *args, **kwargs) -> _instance:
+        if cls._instance is None:
+            cls._instance = super(Database, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        try:
+            if not self.__inited:
+                self.__inited = True
+                _creator: pyodbc = pyodbc
+                _config_database: dict = app_config.ConfigUtil().get_configs().get('DATABASE')
+                _max_connection: int = int(f'{_config_database.get("MAX_CONNECTION")}')
+                _min_cache: int = int(f'{_config_database.get("MIN_CACHE")}')
+                _max_cache: int = int(f'{_config_database.get("MAX_CACHE")}')
+                _max_share: int = int(f'{_config_database.get("MAX_SHARE")}')
+                _blocking: bool = True
+                _user: str = _config_database.get('USER')
+                _password: str = _config_database.get('PASSWORD')
+
+                if _config_database.get('DSN') is None:
+                    self.__pool = PooledDB(
+                        creator=_creator,
+                        maxconnections=_max_connection,
+                        mincached=_min_cache,
+                        maxcached=_max_cache,
+                        maxshared=_max_share,
+                        blocking=_blocking,
+                        host=f'{_config_database.get("IP")},{_config_database.get("PORT")}',
+                        database=f'{_config_database.get("DATABASE")}',
+                        user=_user,
+                        password=_password
+                    )
+                else:
+                    self.__pool = PooledDB(
+                        creator=_creator,
+                        maxconnections=_max_connection,
+                        mincached=_min_cache,
+                        maxcached=_max_cache,
+                        maxshared=_max_share,
+                        blocking=_blocking,
+                        dsn=f'{_config_database.get("DSN")}',
+                        user=_user,
+                        password=_password
+                    )
+        except Exception as e:
+            app_config.LogUtil().error(
+                message=f'{self.__module__}.{self.__class__.__name__}.init Error: {e}'
+            )
+            sys.exit(1)
+
+    def get_connection(self) \
+            -> dbutils.pooled_db.PooledDedicatedDBConnection or dbutils.pooled_db.PooledSharedDBConnection:
+        return self.__pool.connection()
+
+    def select(self, query: str, params: tuple = None) -> list:
+        _rows: list = []
+        _conn: dbutils.pooled_db.PooledDedicatedDBConnection = None
+        try:
+            if self.__pool is not None:
+                _conn = self.__pool.connection()
+                with _conn.cursor() as _cursor:
+                    if params is not None:
+                        _cursor.execute(query, params)
+                    else:
+                        _cursor.execute(query)
+                    _fetch_rows: list[tuple[str or int or float]] = _cursor.fetchall()
+                    _columns: list[str] = [_column[0] for _column in _cursor.description]
+
+                for _fetch_row in _fetch_rows:
+                    _rows.append(dict(zip(_columns, _fetch_row)))
+                app_config.LogUtil().info(message=f'Execute Query: {query}')
+        except Exception as e:
+            app_config.LogUtil().error(
+                message=f'{self.__module__}.{self.__class__.__name__}.select Error: {e}'
+            )
+        finally:
+            if _conn is not None:
+                _conn.close()
+
+        return _rows
+
+    def insert(self, query: str, params: tuple = None) -> None:
+        _conn: dbutils.pooled_db.PooledDedicatedDBConnection = None
+        try:
+            if self.__pool is not None:
+                _conn = self.__pool.connection()
+                with _conn.cursor() as _cursor:
+                    if _conn is not None:
+                        _conn.close()
+                    if params is not None:
+                        _cursor.execute(query, params)
+                    else:
+                        _cursor.execute(query)
+                    _cursor.commit()
+                app_config.LogUtil().info(message=f'Execute Query: {query}, Param: {params}')
+        except Exception as e:
+            app_config.LogUtil().error(
+                message=f'{self.__module__}.{self.__class__.__name__}.insert Error: {e}'
+            )
+        finally:
+            if _conn is not None:
+                _conn.close()
+
+    def select_revisn_data(self) -> list:
+        return self.select(
+            query="""SELECT
+                A.TAG_SN,
+                A.TAG_NM,
+                B.RULE_NM,
+                B.RULE_CN
+            FROM
+                [DBSCHEMA].RDITAG_TB A,
+                [DBSCHEMA].RDIQCRULEMNG_TB B
+            WHERE
+                A.TAG_USE_YN = 'Y'
+                AND A.TAG_RULE_ID = B.RULE_ID""",
+            params=None
+        )
+
+    def insert_revisn_log(self, param: dict) -> list:
+        _list_tag: str or list[str] or list[dict] = param.get('tagList')
+        _result = []
+        if _list_tag in app_config.ConfigUtil().get_none_values():
+            return _result
+        elif type(_list_tag) == str:
+            _list_tag = json.loads(_list_tag)
+
+        now: str = datetime.now().strftime('%Y-%m-%d')
+
+        """_str_insert_subfix: str = '(?, ?, ?, ?, ?, ?, ?), '"""
+        _str_insert_subfix: str = 'INTO [DBSCHEMA].RDIREVISNLOG_TB (REVISN_DT, DATA_SAVE_DT, TAG_SN, LAST_VALUE, OLD_VALUE, REVISN_RESN, REVISN_REMARK) VALUES (?, ?, ?, ?, ?, ?, ?) '
+        for _dict_tag in _list_tag:
+            _list_insert_param: list = []
+            _tag_nm: str = _dict_tag.get('name')
+            _result.append(_tag_nm)
+            _tag_sn: str = _dict_tag.get('sn')
+            _rule_nm: str = _dict_tag.get('rule')
+            _list_tag_values: list = _dict_tag.get('values')
+            _auto: str = _dict_tag.get('auto', 'true').lower()
+            _revisn_resn = '자동보정' if _auto == 'true' else '자동보정호출'
+
+            for _dict_values in _list_tag_values:
+                _save_dt: str = _dict_values.get('time').replace('-', '').replace(' ', '').replace(':', '').replace('.000', '')
+                _last_value: str = _dict_values.get('val') if _dict_values.get('val') is not None else ''
+                _old_value: str = _dict_values.get('old') if _dict_values.get('old') is not None else ''
+                _param: dict = {
+                    'REVISN_DT': now,
+                    'DATA_SAVE_DT': _save_dt,
+                    'TAG_SN': _tag_sn,
+                    'LAST_VALUE': _last_value,
+                    'OLD_VALUE': _old_value,
+                    'REVISN_RESN': _revisn_resn,
+                    'REVISN_REMARK': f'[자동보정] {_rule_nm}'
+                }
+                _params: tuple = (
+                    _param.get('REVISN_DT', ''),
+                    _param.get('DATA_SAVE_DT', ''),
+                    _param.get('TAG_SN', ''),
+                    _param.get('LAST_VALUE', ''),
+                    _param.get('OLD_VALUE', ''),
+                    _param.get('REVISN_RESN', ''),
+                    _param.get('REVISN_REMARK', '')
+                )
+                _list_insert_param.append(_params)
+            _query_len = len(_list_insert_param)
+            _split_len = 0
+            _string_io = StringIO()
+            """_string_io.write('INSERT INTO [DBSCHEMA].RDIREVISNLOG_TB (REVISN_DT, DATA_SAVE_DT, TAG_SN, LAST_VALUE, OLD_VALUE, REVISN_RESN, REVISN_REMARK) VALUES ')"""
+            _string_io.write('INSERT ALL ')
+            _tuple_param: tuple = ()
+            for _idx in range(_query_len):
+                _tuple_param = _tuple_param + _list_insert_param[_idx]
+                _string_io.write(_str_insert_subfix)
+                _split_len += 1
+                if _split_len > self.__max_insert_row_count or (_idx == _query_len - 1):
+                    _split_len = 0
+                    """_str_insert = _string_io.getvalue()[:-2]"""
+                    _string_io.write('SELECT * FROM dual')
+                    _str_insert = _string_io.getvalue()
+                    self.insert(
+                        query=_str_insert,
+                        params=_tuple_param
+                    )
+                    _string_io.seek(0)
+                    _string_io.truncate(0)
+                    """_string_io.write('INSERT INTO [DBSCHEMA].RDIREVISNLOG_TB (REVISN_DT, DATA_SAVE_DT, TAG_SN, LAST_VALUE, OLD_VALUE, REVISN_RESN, REVISN_REMARK) VALUES ')"""
+                    _string_io.write('INSERT ALL ')
+                    _tuple_param: tuple = ()
+            _string_io.close()
+        _result_set = set(_result)
+        _result = list(_result_set)
+        return _result
+
+
+class Historian:
+    """ 히스토리안 클래스 """
+    _instance = None
+    __inited: bool = False
+    __disposed_value: bool = False
+    __list_none_value: list = None
+    __local_time: bool or int = False
+    __date_time_format: str = ''
+    __server = None
+    __ihuApi = None
+    __ihuErrEnum = None
+    __ihuDataEnum = None
+    __ihuQualityEnum = None
+    __ihuTagPropertiesEnum = None
+    __ihuDataSample = None
+    __c_convert = None
+    __c_datetime = None
+
+    def __new__(cls, *args, **kwargs) -> _instance:
+        if cls._instance is None:
+            cls._instance = super(Historian, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        """if not self.__inited:"""
+        self.__inited = True
+        self.__list_none_value = app_config.ConfigUtil().get_none_values()
+        if getattr(sys, 'frozen', False):
+            _this_path: str = os.path.dirname(sys.executable)
+        else:
+            _this_path: str = os.path.dirname(os.path.abspath(__file__))
+        _config: dict = app_config.ConfigUtil().get_configs().get('CONFIG')
+        _num: str = ''.join(re.findall(r'\d+', _config.get('BIT')))
+        if _num == '32':
+            _dll_ihuapi: str = 'IHUAPI_32.dll'
+            _dll_utilities: str = 'Utilities_32.dll'
+        else:
+            _dll_ihuapi: str = 'IHUAPI.dll'
+            _dll_utilities: str = 'Utilities.dll'
+        self.__date_time_format = _config.get('DATEFORMAT')
+        ctypes.CDLL(os.path.join(_this_path, 'dll', _dll_ihuapi))
+        clr.AddReference(os.path.join(_this_path, 'dll', _dll_utilities))
+        from Proficy.Historian.UserAPI import (
+            IHUAPI,
+            ihuErrorCode,
+            ihuDataType,
+            ihuQualityStatus,
+            ihuTagProperties,
+            IHU_DATA_SAMPLE,
+            IHU_RAW_QUALITY
+        )
+        from System import DateTime as CDateTime, Convert as CConvert
+        self.__ihuApi: Proficy.Historian.userapi.IHUAPI = IHUAPI
+        self.__ihuErrEnum: Proficy.Historian.userapi.ihuErrorCode = ihuErrorCode
+        self.__ihuDataEnum: Proficy.Historian.userapi.ihuDataType = ihuDataType
+        self.__ihuQualityEnum: Proficy.Historian.userapi.ihuQualityStatus = ihuQualityStatus
+        self.__ihuTagPropertiesEnum: Proficy.Historian.userapi.ihuTagProperties = ihuTagProperties
+        self.__ihuDataSample: Proficy.Historian.userapi.IHU_DATA_SAMPLE = IHU_DATA_SAMPLE
+        self.__ihuRawQuality: Proficy.Historian.userapi.IHU_RAW_QUALITY = IHU_RAW_QUALITY
+        self.__c_datetime: System.DateTime = CDateTime
+        self.__c_convert: System.Convert = CConvert
+
+    def connect(self) -> bool:
+        return self.__connect()
+
+    def __connect(self) -> bool:
+        _config_historian: dict = app_config.ConfigUtil().get_configs().get('HISTORIAN')
+        _ip: str = _config_historian.get('IP')
+        _user: str = _config_historian.get('USER')
+        _password: str = _config_historian.get('PASSWORD')
+        _local_time: str = _config_historian.get('LOCAL_TIME')
+        if _local_time.lower() == 'true':
+            self.__local_time: bool = True
+        elif _local_time.lower() == 'false':
+            self.__local_time: bool = False
+        elif re.fullmatch(r'^-?[0-9]$', _local_time):
+            self.__local_time: int = int(_local_time)
+        _connect_result: tuple = self.__ihuApi.ihuConnect(_ip, _user, _password)
+        _err_code: Proficy.Historian.userapi.ihuErrorCode = _connect_result[0]
+        self.__server: int = _connect_result[1]
+        return _err_code == self.__ihuErrEnum.OK
+
+    def __disposed(self, disposing: bool) -> None:
+        if not self.__disposed_value:
+            if disposing:
+                self.__disconnect()
+            self.__disposed_value = True
+
+    def __disconnect(self) -> None:
+        self.__ihuApi.ihuDisconnect(self.__server)
+
+    def req_values(self, param: dict) -> str:
+        _list_tag: str or list[str] = param.get('tagList')
+        if _list_tag in self.__list_none_value:
+            return ''
+        elif type(_list_tag) == str:
+            _list_tag = json.loads(_list_tag)
+
+        _result: str = ''
+        if self.__connect():
+            _result = self.__req_values(list_tag=_list_tag)
+            self.__disconnect()
+        self.__disposed(disposing=True)
+
+        return _result
+
+    def __req_values(self, list_tag: list[str]) -> str:
+        app_config.LogUtil().info(message=f'ReqValues: {list_tag}')
+        _read_value_result: tuple = self.__ihuApi.ihuReadCurrentValue(self.__server, list_tag)
+        _err_code_read_value_result: Proficy.Historian.userapi.ihuErrorCode = _read_value_result[0]
+        _p_data: (
+                Proficy.Historian.userapi.IHU_DATA_SAMPLE or
+                list[Proficy.Historian.userapi.IHU_DATA_SAMPLE]
+        ) = _read_value_result[1]
+        _p_err: (
+                Proficy.Historian.userapi.ihuErrorCode or
+                list[Proficy.Historian.userapi.ihuErrorCode]
+        ) = _read_value_result[2]
+
+        _list_result: list[dict] = []
+        if _p_data is not None:
+            for _idx, _value in enumerate(_p_data):
+                _dict_result: dict = {}
+                if _p_err[_idx] != self.__ihuErrEnum.INVALID_TAGNAME:
+                    _switch: dict = {
+                        self.__ihuDataEnum.Undefined: str(_value.Value.Integer),
+                        self.__ihuDataEnum.Short: str(_value.Value.Integer),
+                        self.__ihuDataEnum.Integer: str(_value.Value.Integer),
+                        self.__ihuDataEnum.Float: str(_value.Value.Float),
+                        self.__ihuDataEnum.DoubleFloat: str(_value.Value.Float)
+                    }
+                    _str_value: str = _switch.get(_value.ValueDataType, str(_value.Value.Integer))
+                    _timestamp_result: tuple = self.__ihuApi.IHU_TIMESTAMP_ToParts(_value.TimeStamp)
+                    _err_code_timestamp: Proficy.Historian.userapi.ihuErrorCode = _timestamp_result[0]
+                    _dt_time_before: str = _timestamp_result[1].ToString()
+                    _dt_time_before: str = _dt_time_before.replace('오전', 'AM').replace('오후', 'PM')
+                    _dt: datetime = datetime.strptime(_dt_time_before, self.__date_time_format)
+                    _dict_result['name']: str = _value.Tagname
+                    _dict_result['time']: str = _dt.strftime('%Y-%m-%d %H:%M:%S')
+                    _dict_result['val']: str = _str_value
+                    _dict_result['conf']: int = \
+                        100 if _value.Quality.ToString() == self.__ihuQualityEnum.OPCGood.ToString() else 0
+                    _list_result.append(_dict_result)
+
+        _str_result: str = '{"cmd": "reqValues", "param": []}'
+        if len(_list_result) > 0:
+            _dict_result_: dict = {
+                'cmd': 'reqValues',
+                'param': _list_result
+            }
+            _str_result = str(_dict_result_)
+
+        return _str_result
+
+    def fetch_values(self, param: dict) -> str:
+        _list_tag: str or list[str] = param.get('tagList')
+        if _list_tag in self.__list_none_value:
+            return ''
+        elif type(_list_tag) == str:
+            _list_tag = json.loads(_list_tag)
+
+        _str_start: str = param.get('start')
+        _str_dt_format = '%Y-%m-%d %H:%M:%S'
+        _str_start = (datetime.strptime(_str_start, _str_dt_format) - timedelta(seconds=1)).strftime(_str_dt_format)
+        _str_end: str = param.get('end')
+
+        _result: str = ''
+        if self.__connect():
+            _result = self.__fetch_values(list_tag=_list_tag, str_start=_str_start, str_end=_str_end)
+            self.__disconnect()
+        self.__disposed(disposing=True)
+
+        return _result
+
+    def __fetch_values(self, list_tag: list[str], str_start: str, str_end: str) -> str:
+        app_config.LogUtil().info(message=f'FetchValues: {list_tag}')
+        try:
+            if type(self.__local_time) == bool:
+                if self.__local_time:
+                    _dt_start: System.DateTime = self.__c_convert.ToDateTime(str_start).ToLocalTime()
+                    _dt_end: System.DateTime = self.__c_convert.ToDateTime(str_end).ToLocalTime()
+                else:
+                    _dt_start: System.DateTime = self.__c_convert.ToDateTime(str_start)
+                    _dt_end: System.DateTime = self.__c_convert.ToDateTime(str_end)
+            else:
+                _dt_start: System.DateTime = self.__c_convert.ToDateTime(str_start).AddHours(self.__local_time)
+                _dt_end: System.DateTime = self.__c_convert.ToDateTime(str_end).AddHours(self.__local_time)
+        except Exception as e:
+            app_config.LogUtil().error(
+                message=f'{self.__module__}.{self.__class__.__name__}.fetch_value Error: {e}'
+            )
+            return ''
+        _start_time_result: tuple = self.__ihuApi.IHU_TIMESTAMP_FromParts(_dt_start)
+        _end_time_result: tuple = self.__ihuApi.IHU_TIMESTAMP_FromParts(_dt_end)
+        _err_code_start: Proficy.Historian.userapi.ihuErrorCode = _start_time_result[0]
+        _timestamp_start: Proficy.Historian.UserAPI.IHU_TIMESTAMP = _start_time_result[1]
+        _err_code_end: Proficy.Historian.userapi.ihuErrorCode = _end_time_result[0]
+        _timestamp_end: Proficy.Historian.UserAPI.IHU_TIMESTAMP = _end_time_result[1]
+
+        _list_result: list[dict] = []
+        for _tag in list_tag:
+            _read_raw_result: tuple = self.__ihuApi.ihuReadRawDataByTime(
+                self.__server, _tag, _timestamp_start, _timestamp_end
+            )
+            _p_err: Proficy.Historian.userapi.ihuErrorCode = _read_raw_result[0]
+            _p_data: (
+                    Proficy.Historian.userapi.IHU_DATA_SAMPLE or
+                    list[Proficy.Historian.userapi.IHU_DATA_SAMPLE]
+            ) = _read_raw_result[1]
+            if _p_data is not None:
+                _list_result_: list[dict] = []
+                for _value in _p_data:
+                    _dict_result_: dict = {}
+                    if _p_err != self.__ihuErrEnum.INVALID_TAGNAME:
+                        _switch: dict = {
+                            self.__ihuDataEnum.Short: str(_value.Value.Integer),
+                            self.__ihuDataEnum.Integer: str(_value.Value.Integer),
+                            self.__ihuDataEnum.Float: str(_value.Value.Float),
+                            self.__ihuDataEnum.DoubleFloat: str(_value.Value.Float)
+                        }
+                        _str_value: str = _switch.get(_value.ValueDataType, str(_value.Value.Integer))
+                        _timestamp_result: tuple = self.__ihuApi.IHU_TIMESTAMP_ToParts(_value.TimeStamp)
+                        _timestamp_err_code: Proficy.Historian.userapi.ihuErrorCode = _timestamp_result[0]
+                        _dt_time_before: str = _timestamp_result[1].ToString()
+                        _dt_time_before: str = _dt_time_before.replace('오전', 'AM').replace('오후', 'PM')
+                        _dt: datetime = datetime.strptime(_dt_time_before, self.__date_time_format)
+                        _dict_result_['time']: str = _dt.strftime('%Y-%m-%d %H:%M:%S')
+                        _dict_result_['val']: str = _str_value
+                    _list_result_.append(_dict_result_)
+
+                _dict_result: dict = {
+                    'name': _tag,
+                    'values': _list_result_
+                }
+                _list_result.append(_dict_result)
+
+        _str_result: str = '{"cmd": "fetchValues", "param": []}'
+        if len(_list_result) > 0:
+            _dict_result_: dict = {
+                'cmd': 'fetchValues',
+                'param': _list_result
+            }
+            _str_result = str(_dict_result_)
+        return _str_result
+
+    def put_values(self, param: dict) -> str:
+        _list_tag: str or list[str] or list[dict] = param.get('tagList')
+        if _list_tag in self.__list_none_value:
+            return ''
+        elif type(_list_tag) == str:
+            _list_tag = json.loads(_list_tag)
+
+        _result: str = ''
+        if self.__connect():
+            _result = asyncio.run(self.__put_values(list_data=_list_tag))
+            self.__disconnect()
+        self.__disposed(disposing=True)
+
+        return _result
+
+    async def __put_values(self, list_data: list[dict]) -> str:
+        _list_result_err_code: list = []
+        _list_tag_name: list = []
+        for _data in list_data:
+            _tag_name: str = _data.get('name')
+            _list_tag_name.append(_tag_name)
+            _tag_values: list[dict] = _data.get('values')
+            if _tag_name in self.__list_none_value:
+                continue
+
+            _list_data_sample: Proficy.Historian.userapi.IHU_DATA_SAMPLE = []
+            _list_err_code: Proficy.Historian.userapi.ihuErrorCode = []
+            for _tag_value in _tag_values:
+                _time: str = _tag_value.get('time')
+                _val: str = _tag_value.get('val')
+                _type: str = _tag_value.get('type')
+                _switch_type: dict = {
+                    'short': self.__ihuDataEnum.Short,
+                    'int': self.__ihuDataEnum.Integer,
+                    'float': self.__ihuDataEnum.Float,
+                    'doubleFloat': self.__ihuDataEnum.DoubleFloat
+                }
+                _switch_object: dict = {
+                    'short': self.__c_convert.ToSingle,
+                    'int': self.__c_convert.ToSingle,
+                    'float': self.__c_convert.ToSingle,
+                    'doubleFloat': self.__c_convert.ToDouble
+                }
+                if _time in self.__list_none_value or _val in self.__list_none_value:
+                    continue
+                try:
+                    if type(self.__local_time) == bool:
+                        if self.__local_time:
+                            _dt_time: System.DateTime = self.__c_convert.ToDateTime(_time).ToLocalTime()
+                        else:
+                            _dt_time: System.DateTime = self.__c_convert.ToDateTime(_time)
+                    else:
+                        _dt_time: System.DateTime = self.__c_convert.ToDateTime(_time).AddHours(self.__local_time)
+                except Exception as e:
+                    app_config.LogUtil().error(
+                        message=f'{self.__module__}.{self.__class__.__name__}.fetch_value Error: {e}'
+                    )
+                    return ''
+                data_sample: Proficy.Historian.userapi.IHU_DATA_SAMPLE = self.__ihuDataSample()
+                _time_result: tuple = self.__ihuApi.IHU_TIMESTAMP_FromParts(_dt_time)
+                _time_err_code: Proficy.Historian.userapi.ihuErrorCode = _time_result[0]
+                _timestamp: Proficy.Historian.UserAPI.IHU_TIMESTAMP = _time_result[1]
+                data_sample.Tagname = _tag_name
+                data_sample.TimeStamp = _timestamp
+                data_sample.ValueDataType = _switch_type.get(_type, self.__ihuDataEnum.Integer)
+                if re.fullmatch(r'^-?\d+(\.\d+)?$', str(_val)):
+                    _float_val = float(_val)
+                else:
+                    _float_val = _val
+                data_sample.ValueObject = _switch_object.get(_type, self.__c_convert.ToSingle)(_float_val)
+                _raw_quality: Proficy.Historian.userapi.IHU_RAW_QUALITY = self.__ihuRawQuality()
+                _raw_quality.QualityStatus = self.__ihuQualityEnum.OPCGood
+                data_sample.Quality = _raw_quality
+                _list_data_sample.append(data_sample)
+
+            _result_err_code = self.__ihuApi.ihuWriteData(
+                self.__server, _list_data_sample, _list_err_code, False, False
+            )
+            _dict_result: dict = {
+                'name': _tag_name,
+                'value': _result_err_code.ToString()
+            }
+            _list_result_err_code.append(_dict_result)
+
+        app_config.LogUtil().info(message=f'PutValues: {_list_tag_name}')
+        _result_str: str = f'{{"cmd": "putValues", "param": {_list_result_err_code}}}'
+
+        return _result_str
+
+
+class BizNexus:
+    """ 비즈넥서스 통신 클래스 """
+    _instance = None
+    __inited: bool = False
+    __ip: str = None
+    __port: int = None
+    __tagapi: ctypes.WinDLL = None
+
+    def __new__(cls, *args, **kwargs) -> _instance:
+        if cls._instance is None:
+            cls._instance = super(BizNexus, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        if not self.__inited:
+            self.__inited = True
+            _config_biznexus: dict = app_config.ConfigUtil().get_configs().get('BIZNEXUS')
+            self.__ip = str(f'{_config_biznexus.get("IP")}')
+            self.__port = int(f'{_config_biznexus.get("PORT")}')
+            if getattr(sys, 'frozen', False):
+                _this_path: str = os.path.dirname(sys.executable)
+            else:
+                _this_path: str = os.path.dirname(os.path.abspath(__file__))
+            _dll_tagapi: str = 'TagAPI64.dll'
+            #self.__tagapi = ctypes.WinDLL(os.path.join(_this_path, 'dll', _dll_tagapi))
+            self.__tagapi = ctypes.CDLL(os.path.join(_this_path, 'dll', _dll_tagapi))
+            self.__tagapi.TagConnect._argtypes_ = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint16]
+            self.__tagapi.TagConnect.restype = ctypes.c_ulong
+
+            self.__tagapi.TagDisconnect.restype = ctypes.c_ulong
+
+            self.__tagapi.TagExec._argtypes_ = [ctypes.c_char_p]
+            self.__tagapi.TagExec.restype = ctypes.c_char_p
+            self.__connect()
+
+    def __connect(self) -> int:
+        """ 비즈넥서스 연결 """
+        return self.__tagapi.TagConnect(self.__ip.encode('utf-8'), "".encode('utf-8'), self.__port)
+
+    def close(self) -> int:
+        """ 비즈넥서스 종료 """
+        return self.__tagapi.TagDisconnect()
+
+    def exec(self, str_cmd: str) -> str:
+        """ 비즈넥서스 명령 실행 """
+        _result: bytes = self.__tagapi.TagExec(str_cmd.encode('utf-8'))
+        return ctypes.string_at(_result).decode('utf-8')
+
+class Socket:
+    """ 소켓통신 클래스 """
+    _instance = None
+    __inited: bool = False
+    __ip: str = None
+    __port: int = None
+    __buffer_size: int = None
+    __socket_thread: threading.Thread = None
+
+    def __new__(cls, *args, **kwargs) -> _instance:
+        if cls._instance is None:
+            cls._instance = super(Socket, cls).__new__(cls)
+        return cls._instance
+
+    def __init__(self) -> None:
+        if not self.__inited:
+            self.__inited = True
+            try:
+                _config_socket: dict = app_config.ConfigUtil().get_configs().get('SOCKET')
+                self.__ip = str(f'{_config_socket.get("IP")}')
+                self.__port = int(f'{_config_socket.get("PORT")}')
+                _buffer_size: str = str(f'{_config_socket.get("BUFFER_SIZE")}')
+                _var_pattern: str = r'^[0-9 *]*[0-9 ]$'
+                if _buffer_size is None or not re.fullmatch(_var_pattern, _buffer_size):
+                    self.__buffer_size = 10 * 1024 * 1024
+                else:
+                    self.__buffer_size = eval(_buffer_size)
+                    if self.__buffer_size <= 1024:
+                        self.__buffer_size = 10 * 1024 * 1024
+            except Exception as e:
+                app_config.LogUtil().error(
+                    message=f'{self.__module__}.{self.__class__.__name__}.init Error: {e}'
+                )
+                sys.exit(1)
+
+    def start_server(self) -> None:
+        """ 소켓 서버 쓰레드 실행 """
+        self.__socket_thread = threading.Thread(target=self.__start_server)
+        self.__socket_thread.start()
+
+    def __start_server_async(self) -> None:
+        """ 소켓 서버 실행(비동기식) """
+        asyncio.run(self.__async_start_server())
+
+    async def __async_start_server(self) -> None:
+        """ 소켓 서버 실제 실행(비동기식) """
+
+        async def __handle_client(reader, writer) -> None:
+            _addr_: tuple = writer.get_extra_info('peername')
+            app_config.LogUtil().info(message=f'Server Connect to {_addr_}')
+
+            while True:
+                _receive_data = await reader.read(self.__buffer_size)
+                if not _receive_data:
+                    break
+                _str_receive: str = _receive_data.decode(encoding='utf-8')
+                app_config.LogUtil().info(message=f'Receive Data: {_str_receive}')
+                _send_data: bytes = self.__data_process_logic(receive_data=_str_receive)
+                writer.write(_send_data)
+                await writer.drain()
+
+            writer.close()
+
+        _server = await asyncio.start_server(__handle_client, self.__ip, self.__port)
+        _addr = _server.sockets[0].getsockname()
+        app_config.LogUtil().info(message=f'Server Start: {_addr}')
+
+        async with _server:
+            await _server.serve_forever()
+
+    def __start_server(self) -> None:
+        """ 소켓 서버 실제 실행 """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _server_socket:
+            _server_socket.bind((self.__ip, self.__port))
+            _server_socket.listen()
+            app_config.LogUtil().info(message=f'Server Start: {self.__ip}:{self.__port}')
+
+            while True:
+                _client_socket, _addr = _server_socket.accept()
+                app_config.LogUtil().info(message=f'Server Connect to {_addr}')
+                _receive_data: bytes = _client_socket.recv(self.__buffer_size)
+                _str_receive: str = _receive_data.decode(encoding='utf-8')
+                app_config.LogUtil().info(message=f'Receive Data: {_str_receive}')
+                _process_thread = threading.Thread(target=self.__data_process, args=(_str_receive, _client_socket))
+                _process_thread.start()
+
+    def __data_process(self, receive_data: str, client_socket: socket.socket) -> None:
+        """ 받은 데이터 처리 및 리턴 데이터 """
+        if type(receive_data) == bytes:
+            receive_data = receive_data.encode('utf-8')
+        try:
+            _result = self.__data_process_logic(receive_data=receive_data)
+            client_socket.sendall(_result)
+        except Exception as e:
+            traceback.print_exc()
+            app_config.LogUtil().error(
+                message=f'{self.__module__}.{self.__class__.__name__}.data_process Error: {e}'
+            )
+        finally:
+            client_socket.close()
+
+    def __data_process_logic(self, receive_data: str) -> bytes:
+        """ 받은 데이터 처리 및 리턴 데이터 로직 """
+        _result: str = '{"cmd": "Failed"}'
+        _byte_result = b''
+        try:
+            _dict_receive: dict = json.loads(receive_data)
+            _cmd: str = _dict_receive.get('cmd')
+            if _cmd == 'reqValues':
+                _result = Historian().req_values(param=_dict_receive.get('param')).replace("'", '"')
+            elif _cmd == 'fetchValues':
+                _result = Historian().fetch_values(param=_dict_receive.get('param')).replace("'", '"')
+            elif _cmd == 'putValues':
+                _result = Historian().put_values(param=_dict_receive.get('param')).replace("'", '"')
+            elif _cmd == 'revisnData':
+                _result = _result
+                _result_data = logics.Logics().revisn_data(dict_cmd=_dict_receive, list_revisn_tag=None)
+                _result = json.dumps(_result_data, ensure_ascii=False).replace("'", '"')
+            _byte_result = _result.encode('utf-8')
+        except Exception as e:
+            traceback.print_exc()
+            app_config.LogUtil().error(
+                message=f'{self.__module__}.{self.__class__.__name__}.data_process_logic Error: {e}'
+            )
+        return _byte_result
+
+    def test(self, cmd: str = 'req', req_data: str = None) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _client_socket:
+            _client_socket.connect((self.__ip, self.__port))
+            _switch_ex = {
+                'req': b"""{
+                    "cmd": "reqValues",
+                    "param": {
+                        "tagList": [
+                            "TEST01",
+                            "TEST02",
+                            "TEST04"
+                        ]
+                    }
+                }""",
+                'fetch': b"""{
+                    "cmd": "fetchValues",
+                    "param": {
+                        "tagList": [
+                            "TEST01",
+                            "TEST02",
+                            "TEST04"
+                        ],
+                        "start": "2024-09-11 16:14:00",
+                        "end": "2024-09-11 16:14:10"
+                    }
+                }""",
+                'write': b"""{
+                    "cmd": "putValues",
+                    "param": {
+                        "tagList": [
+                            {
+                                "name": "TEST01",
+                                "values": [
+                                    {
+                                        "time": "2024-09-11 16:14:00",
+                                        "val": "27.0",
+                                        "type": "float"
+                                    },
+                                    {
+                                        "time": "2024-09-11 16:14:10",
+                                        "val": "27.0",
+                                        "type": "float"
+                                    }
+                                ]
+                            },
+                            {
+                                "name": "TEST02",
+                                "values": [
+                                    {
+                                        "time": "2024-09-11 16:40:00",
+                                        "val": "30.0",
+                                        "type": "float"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                }""",
+                'revisn': b"""{
+                    "cmd": "revisnData",
+                    "param": {
+                        "tagList": ["TEST01"],
+                        "start": "2024-09-11 16:14:00",
+                        "end": "2024-09-11 16:14:10",
+                        "auto": "false"
+                    }
+                }"""
+            }
+            if req_data is not None:
+                _client_socket.sendall(req_data.encode('utf-8'))
+            else:
+                _client_socket.sendall(_switch_ex.get(cmd))
+            _bytes_recv_data: bytes = _client_socket.recv(100 * 1024 * 1024)
+            _str_result: str = _bytes_recv_data.decode(encoding='utf-8')
+            print(_str_result)
