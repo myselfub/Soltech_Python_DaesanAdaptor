@@ -1,5 +1,5 @@
-# DaesanAdaptor
-Python 대산 어댑터
+# Soltech_Python_DaesanAdaptor
+솔텍시스템-한국수자원공사/하니웰 대산해수담수화 어댑터 프로그램, Python
 
 pip install pyodbc
 pip install pythonnet
